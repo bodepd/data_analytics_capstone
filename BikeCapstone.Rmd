@@ -1,0 +1,785 @@
+---
+title: "BikeCapstone"
+author: "Dan Bode"
+output: html_document
+date: "2023-12-22"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Task
+
+### About
+
+Cyclistic’s is a bike ride-sharing company with 5,824 bicycles and 692 docking stations
+that offers traditional bikes, reclining bikes, hand tricycles, and cargo bikes.
+  * bikes can be un-docked from any station and returned to any station at any time
+  * 8% of riders users use non-traditional options
+  * 30% of users commute to work every day
+
+They offer casual (single use/day pass) and membership plans
+
+## The Goal
+
+Cyclistic’s finance analysts have concluded that members are more profitable than casual riders and
+that the best plan for future growth is to target casual users for conversion
+to membership. The overall strategy is to do the following:
+* How do members and casual riders differ?
+* Why would casual users buy annual memberships?
+* How can digital media influence casual riders to become members?
+
+# The ask
+
+Out of the overall marketing plan, I have been tasked to look at existing data
+and identify ways in which the behavior of casual riders and members differ. In 
+particular, in what ways to they differ in that can be leveraged to identify ways
+to apply marketing at casual users for conversion.
+
+# Setup
+
+This workbook requires the following packages and libraries.
+
+```{r}
+r = getOption("repos")
+r["CRAN"] = "http://cran.us.r-project.org"
+options(repos = r)
+install.packages('RJSONIO')
+install.packages('tidyverse')
+install.packages('ggplot2')
+install.packages('sf')
+install.packages('gridExtra')
+# using distm to measure distance between lat/lng pairs
+install.packages('geosphere')
+install.packages('lubridate')
+library(lubridate)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(sf)
+library(RJSONIO)
+library(gridExtra)
+library(geosphere)
+library(scales)
+```
+
+## Data Sources
+
+### Customer Data
+
+Customer trip data can be found [here](https://divvy-tripdata.s3.amazonaws.com/index.html). Even though
+the filenaming formats have changed over time, each file represents the entire dataset for a given time-period.
+
+This is the custome'rs dataset so it should be assumed to be accurate.
+
+# NOTE: I started out with a month of data for development, leaving this here so that I can swap back and forth
+#```{r}
+#trip_data <- read.csv("data/202311-divvy-tripdata.csv")
+#```
+
+For this analysis, I will grab all data for 2023
+
+```{r}
+output_dir="data"
+
+# for these data ranges, grab all data and put in a single data frame, trip_data
+
+date_ranges <- c(
+  "202301",
+  "202302",
+  "202303",
+  "202304",
+  "202305",
+  "202306",
+  "202307",
+  "202308",
+  "202309",
+  "202310",
+  "202311"
+)
+
+# store data as trip data
+trip_data <- NULL
+
+for(i in date_ranges) {
+  u <- glue::glue("https://divvy-tripdata.s3.amazonaws.com/{i}-divvy-tripdata.zip")
+  bn <- basename(u)
+  csv_file <- glue::glue("{output_dir}/{i}-divvy-tripdata.csv")
+  download.file(u, file.path(output_dir, basename(u)))
+  unzip(file.path(output_dir, basename(u)),exdir=output_dir)
+  if(is.null(trip_data)) {
+    trip_data <- read.csv(csv_file)
+  } else {
+    trip_data <- rbind(trip_data, read.csv(csv_file))
+  }
+  rm(u)
+  rm(bn)
+  rm(csv_file)
+}
+```
+### Other Datasets
+
+in order to be able to understand how our latitide longitude coordinates overlay
+with neighborhoods, I grabbed the following geo-json file that builds polygons
+that represent them.
+
+
+```{r}
+chi_map <- read_sf("https://data.cityofchicago.org/api/geospatial/cauq-8yn6?method=export&format=GeoJSON")
+```
+
+I had a hypothesis that casual riders that are not going to tourist destinations are
+more like to cover. In order check the relation between rider type and touristic areas,
+I found data form the official Chicago website that provides lat/lng points for
+designated landmarks.
+
+
+```{r}
+landmarks <- read.csv('https://data.cityofchicago.org/resource/tdab-kixi.csv')
+```
+
+## Exploring the Data
+
+A quick look at the column names in our trip_data.
+
+```{r}
+colnames(trip_data)
+```
+
+A quick check to see what percentage of the data has empty values, or if the time
+sequences are in the right order. Does a check, removes some rows and prints
+the difference.
+
+```{r}
+print("Total rows for trip data")
+nrow(trip_data)
+
+tmp_trip_data <- drop_na(trip_data)
+print("Total rows after dropping na")
+nrow(tmp_trip_data)
+
+tmp_trip_data <- tmp_trip_data %>%
+  filter(start_station_id!='')
+print("Total rows after dropping empty start station ids")
+nrow(tmp_trip_data)
+tmp_trip_data <- tmp_trip_data %>%
+  filter(end_station_id!='')
+print("Total rows after dropping empty end station ids")
+nrow(tmp_trip_data)
+
+tmp_trip_data <- tmp_trip_data %>%
+  filter(started_at < ended_at)
+print("Total rows after dropping start times that happen after end times")
+nrow(tmp_trip_data)
+
+tmp_trip_data <- tmp_trip_data %>%
+  filter(!grepl("^Public Rack", start_station_name)) %>%
+  filter(!grepl("^Public Rack", end_station_name))
+print("Total rows after dropping public rack")
+nrow(tmp_trip_data)
+tmp_trip_data <- tmp_trip_data %>%
+  mutate(start_station_name=gsub(" (Temp)", "", start_station_name , fixed = TRUE)) %>%
+  mutate(end_station_name=gsub(" (Temp)", "", end_station_name , fixed = TRUE))
+
+
+cleaned_trip_data <- tmp_trip_data
+```
+
+As a next step, I want to better understand the data
+in each of those columns. I'll do this by asking a few questions, making some
+assumptions, and then exploring the data.
+
+1. is every ride id unique?
+
+
+```{r}
+
+if( nrow(trip_data) != length(unique(trip_data$ride_id))) {
+  sprintf("Each row DOES NOT HAVE a unique ID: %d %d", nrow(trip_data), length(unique(trip_data)))
+}
+```
+
+2. what types of bikes and members do we have?
+
+```{r}
+ggplot(trip_data) + geom_bar(mapping = aes(x=rideable_type, fill=member_casual)) +
+  labs(title="Total rides for each type of bike") + scale_y_continuous(labels = unit_format(unit = "M", scale = 1e-6))
+```
+Rides exist for three types of bikes: electric_bike, classic_bike, and docked_bike - I do not see any reference to reclining bikes, hand tricycles, or cargo bikes - perhaps this means that some of the data is missing?
+
+
+Just a quick query so that I can try to understand what a docked bike is:
+
+```{r}
+docked_bikes <- trip_data %>% filter(rideable_type=='docked_bike')
+View(docked_bikes)
+```
+
+Members are categorized as either casual or member - NOTE: it would be very useful to further break-down casual users to one-time-ride or day-pass.
+
+
+Next, I want to look into the start and end station data to make sure that it all makes
+sense, specifically, there should be the same number of start and end stations (ids and names),
+the same number of lat/long coordinates. I am assuming that each bike starts and
+ends at a station, so I'd like the lat/long data to also map to that.
+```{r}
+tmp_rides <- cleaned_trip_data %>%
+  unite(col='start_lat_long', start_lat, start_lng, sep=",", remove=FALSE) %>%
+  unite(col='end_lat_long', end_lat, end_lng, sep=",", remove=FALSE)
+count_info <- data.frame(
+  column_name=c("start_station_name", "start_station_id", "start_station_lat_lng",
+                "end_station_name", "end_station_id", "end_station_lat_lng"),
+  unique_count=c(
+    length(unique(tmp_rides$start_station_name)),
+    length(unique(tmp_rides$start_station_id)),
+    length(unique(tmp_rides$start_lat_long)),
+    length(unique(tmp_rides$end_station_name)),
+    length(unique(tmp_rides$end_station_id)),
+    length(unique(tmp_rides$end_lat_long))
+  )
+)
+View(count_info)
+```
+
+None of the numbers really add up, and there is especially something wrong with
+the latitude data, I am going to play with the precision a little to see if
+I can get a closer match:
+
+```{r}
+
+lat_long_precision <- function(precision) {
+  tmp_rides <- cleaned_trip_data %>%
+    mutate(round_start_lat=round(start_lat, precision)) %>%
+    mutate(round_start_lng=round(start_lng, precision)) %>%
+    mutate(round_end_lat=round(end_lat, precision)) %>%
+    mutate(round_end_lng=round(end_lng, precision)) %>%
+    unite(col='start_lat_long', round_start_lat, round_start_lng, sep=",", remove=FALSE) %>%
+    unite(col='end_lat_long', round_end_lat, round_end_lng, sep=",", remove=FALSE)
+  return(data.frame(
+    column_name=c('start_lat_long', 'end_lat_long'),
+    unique_count=c(length(unique(tmp_rides$start_lat_long)), length(unique(tmp_rides$end_lat_long))),
+    precision=c(precision, precision)
+  ))
+}
+
+precision_df_1 <- lat_long_precision(1)
+precision_df_2 <- lat_long_precision(2)
+precision_df_3 <- lat_long_precision(3)
+precision_df_4 <- lat_long_precision(4)
+precision_df_5 <- lat_long_precision(5)
+
+precision_compare <- rbind(precision_df_1, precision_df_2, precision_df_3, precision_df_4, precision_df_5)
+View(precision_compare)
+
+```
+
+The closest precision is 3 decimal places which is about 100m distance
+
+Given this statement: " The bikes can be unlocked from one station and returned to
+any other station in the system anytime." I'm extremely confused about the actual data -
+I'd expect the lat/long to be per station for the bike, this data makes it look like
+each bike provides a lat/long per check-out checkin, I would suggest that we
+get that data per station instead. (unless I misunderstand and the bikes can be dropped
+off anywhere).
+
+Neither, the start/end station ids or names are equal, so I want to have a quick peek at the
+data.
+
+```{r}
+length(unique(cleaned_trip_data$start_station_name))
+length(unique(cleaned_trip_data$end_station_name))
+length
+l_diff = sort(setdiff(cleaned_trip_data$start_station_name, cleaned_trip_data$end_station_name))
+r_diff = sort(setdiff(cleaned_trip_data$end_station_name, cleaned_trip_data$start_station_name))
+if (length(l_diff) > length(r_diff)) {
+  length(r_diff) = length(l_diff)
+} else {
+  length(l_diff) = length(r_diff)
+}
+diff_names <- data.frame(
+  only_in_start=l_diff,
+  only_in_end=r_diff
+)
+diff_names
+```
+
+I see a few things going on here:
+
+1. There are a few station names only in end
+2. Almost all of the non-matching entries are prefixed with 'public rack'
+3. There is a little of what looks like test data - "OH - BONFIRE - TESTING"
+
+While I have questions here, there is nothing that I can clean up.
+
+Why are there more station names than ids?
+
+```{r}
+
+y <- cleaned_trip_data %>%
+  group_by(start_station_id) %>%
+  summarise(num_dups=n_distinct(start_station_name)) %>%
+  filter(num_dups > 1)
+
+z <- cleaned_trip_data %>%
+  group_by(end_station_id) %>%
+  summarise(num_dups=n_distinct(end_station_name)) %>%
+  filter(num_dups > 1)
+
+x <- cleaned_trip_data %>% select(start_station_id, start_station_name) %>%
+    distinct()
+
+duplicate_station_names <- left_join(y, x)
+View(duplicate_station_names)
+
+```
+Just one more thing to check, are the lat/long entrees reasonable clustered so
+they actually represent a station?
+
+First, we can graph our lat/lng against a map of Chicago to verify that the datapoints are in Chicago.
+
+```{r}
+ggplot(data = chi_map) + geom_sf() + geom_point(data=cleaned_trip_data, mapping = aes(x=start_lng, y=start_lat))
+```
+
+Next, we can look at the std deviation to make sure that our data points
+are reasonably close to the stations:
+
+```{r}
+
+#calculate the std dev and average lat and lng for each station id
+start_avg_coord <- cleaned_trip_data %>%
+  group_by(start_station_id) %>%
+  summarize(sd_start_lat=sd(start_lat), sd_start_lng=sd(start_lng), mean_start_lat=mean(start_lat), mean_start_lng=mean(start_lng))
+
+end_avg_coord <- cleaned_trip_data %>%
+  group_by(end_station_id) %>%
+  summarize(sd_end_lat=sd(end_lat), sd_end_lng=sd(end_lng), mean_end_lat=mean(end_lat), mean_end_lng=mean(end_lng))
+
+# join the averages into the main data frame (there is probably a better way to do this :)
+df_with_mean_sd <- left_join(cleaned_trip_data, start_avg_coord)
+df_with_mean_sd <- left_join(df_with_mean_sd, end_avg_coord)
+
+#start_distance_in_m <- distance_in_m_between_start_station_points(
+#  df_with_mean_sd,
+#  "mean_start_lng",
+#  "mean_start_lat",
+#  "start_lng",
+#  "start_lat"
+#)
+#df_with_mean_sd["start_diff_from_mean"] <-start_distance_in_m
+
+#end_distance_in_m <- distance_in_m_between_start_station_points(
+#  df_with_mean_sd,
+#  "mean_end_lng",
+#  "mean_end_lat",
+#  "end_lng",
+#  "end_lat"
+#)
+#df_with_mean_sd["end_diff_from_mean"] <- end_distance_in_m
+
+#df_with_mean_sd %>%
+#  arrange(desc(start_diff_from_mean)) %>%
+#  filter(start_diff_from_mean > 1000 | end_diff_from_mean > 1000) %>%
+#  select(start_station_id, start_station_name, start_lat, start_lng, mean_start_lat, mean_start_lng, start_diff_from_mean)
+```
+
+```{r}
+# remove everything more that ~30m from mean
+cleaned_data_rm_lat_lng <- df_with_mean_sd %>%
+  filter(abs(start_lng-mean_start_lng) < .0003) %>%
+  filter(abs(start_lat-mean_start_lat) < .0003) %>%
+  filter(abs(end_lng-mean_end_lng) < .0003) %>%
+  filter(abs(end_lat-mean_end_lat) < .0003)
+
+nrow(df_with_mean_sd)
+nrow(cleaned_data_rm_lat_lng)
+```
+
+
+```{r}
+# I could not figure out how to make this work with apply or through chaining...
+# takes a data frame with columns
+
+distance_in_m_between_start_station_points <- function(df, lng1_col, lat1_col, lng2_col, lat2_col) {
+  ret <- c()
+  for (row in 1:nrow(df)) {
+    if (row %% 100000 == 0) {
+      print(row)
+    }
+    ret[row] <- distm(
+      c(df[row, lng1_col], df[row, lat1_col]),
+      c(df[row, lng2_col], df[row, lat2_col]),
+      fun = distGeo)
+  }
+  return(ret)
+}
+start_distance_in_m <- distance_in_m_between_start_station_points(
+  cleaned_data_rm_lat_lng,
+  "mean_start_lng",
+  "mean_start_lat",
+  "start_lng",
+  "start_lat"
+)
+cleaned_data_rm_lat_lng["start_diff_from_mean"] <-start_distance_in_m
+```
+
+the above table shows that the relationship between lat/lng and the station ids has some issues.
+
+## Adding Context
+
+We are going to make a few changes to the dataset so assist with analysis
+
+1. I want individual columns for Month/Day of week and hour
+2. I want to track ride time and distance
+
+```{r}
+
+# add new columns - day of week, month of year, start_hour and total time for ride
+dated_data <- cleaned_data_rm_lat_lng %>%
+  mutate(start_weekday=wday(as.Date(started_at), label=TRUE, week_start=1)) %>%
+  mutate(start_hour=as.integer(format(as.POSIXct(started_at), format = "%H"))) %>%
+  mutate(start_month=as.integer(format(as.POSIXct(started_at), format = "%m"))) %>%
+  mutate(time_diff=as.double(difftime(ended_at, started_at, units="mins")))
+```
+
+Next, I want to know for every ride, what community it is in. And I want to know
+the percent casual and member rides for each commnity.
+
+```{r}
+start_neighborhood_data <- st_as_sf(start_avg_coord, coords = c("mean_start_lng", "mean_start_lat"), 
+                 crs = 4326, agr = "constant")
+start_neighborhood_data <- st_join(start_neighborhood_data, chi_map, join = st_within) %>% select('start_station_id', 'community') %>% rename(start_community=community) %>% rename(start_geometry=geometry)
+
+end_neighborhood_data <- st_as_sf(end_avg_coord, coords = c("mean_end_lng", "mean_end_lat"), 
+                 crs = 4326, agr = "constant")
+end_neighborhood_data <- st_join(end_neighborhood_data, chi_map, join = st_within) %>% select('end_station_id', 'community') %>% rename(end_community=community) %>% rename(end_geometry=geometry)
+
+dated_community_data <- left_join(dated_data, start_neighborhood_data)
+dated_community_data <- left_join(dated_community_data, end_neighborhood_data)
+
+
+start_community_by_member_type <- dated_community_data %>%
+  group_by(member_casual) %>%
+  count(start_community)
+
+start_community <- c()
+percent_casual <- c()
+
+for (i in 1:nrow(chi_map)) {
+  comm <- chi_map$community[i]
+  start_community <- append(start_community, comm[1])
+  casual_count <- (start_community_by_member_type %>% filter(start_community==comm & member_casual=='casual'))$n
+  member_count <- (start_community_by_member_type %>% filter(start_community==comm & member_casual=='member'))$n
+  if (identical(member_count, integer(0))) {
+    percent_casual <- append(percent_casual, 1)
+  } else if (identical(casual_count, integer(0))) {
+    percent_casual <- append(percent_casual, 0)
+  } else {
+    percent_casual <- append(percent_casual, casual_count/(casual_count + member_count))
+  }
+}
+
+df <- data.frame(community=start_community, percent_casual=percent_casual)
+View(df)
+```
+
+```{r}
+tmp_chi_map <- chi_map
+tmp_chi_map['percent_casual'] <- percent_casual
+ggplot(data=tmp_chi_map) + geom_sf(aes(fill = percent_casual)) +
+  labs(title="Casual rides starting from neighborhood", subtitle="2023") +
+  scale_fill_continuous(labels=scales::percent)
+```
+       
+```{r}
+x <- start_community_by_member_type %>% filter(n > 20000)
+ggplot(x) +
+  geom_col(aes(x=start_community, y=n, fill=member_casual)) +
+  theme(axis.text.x = element_text(color="#993333", 
+                           angle=-90)) + 
+  scale_y_continuous(labels = unit_format(unit = "K", scale = 1e-3)) +
+  labs(title="Rides starting in neighorhood", subtitle="(over 20k rides - 2023)", y="count")
+
+x <- start_community_by_member_type %>% filter(n > 1000 & n < 20000)
+ggplot(x) +
+  geom_col(aes(x=start_community, y=n, fill=member_casual)) +
+  theme(axis.text.x = element_text(color="#993333", 
+                           angle=-90)) +
+  scale_y_continuous(labels = unit_format(unit = "K", scale = 1e-3))+
+  labs(title="Rides starting in neighorhood", subtitle="(1k-20k rides - 2023)", y="count")
+x <- start_community_by_member_type %>% filter(n < 1000)
+ggplot(x) +
+  geom_col(aes(x=start_community, y=n, fill=member_casual)) +
+  theme(axis.text.x = element_text(color="#993333", angle=-90))+
+  labs(title="Rides starting in neighorhood", subtitle="(less than 1k rides - 2023)", y="count")
+```
+
+
+```{r}
+
+dated_trip_data <- dated_community_data %>%
+  select(started_at, ended_at, time_diff, start_weekday) %>%
+  arrange(time_diff)
+
+gb_member_type <- dated_community_data %>%
+  group_by(member_casual) %>%
+  summarize(
+    avg_length=mean(time_diff),
+    median_length=median(time_diff),
+    max_length=max(time_diff),
+    min_length=min(time_diff),
+    most_common_weekday=(which.max(table(start_weekday))),
+    most_common_month=(which.max(table(start_month)))
+  )
+
+head(gb_member_type)
+``` 
+
+```{r}
+dated_community_data <- dated_community_data %>%
+  mutate(grp=case_when(time_diff < 5 ~ 'A-<5m',
+  time_diff < 15 ~ 'B-<15m',
+  time_diff < 30 ~ 'C-<30m',
+  time_diff < 60 ~ 'D-<60m',
+  time_diff < 120 ~ 'E-<120m',
+  time_diff < 240 ~ 'F-<240m',
+  time_diff < 360 ~ 'G-<360m',
+  time_diff < 600 ~ 'H-<600m',
+  time_diff < 1200 ~'I-<1200m'))
+```
+
+```{r}
+ggplot(dated_community_data) + geom_bar(mapping = aes(x=member_casual)) +
+  scale_y_continuous(labels = unit_format(unit = "M", scale = 1e-6)) +
+  labs(title="Total rides by member type", subtitle="2023")
+```
+```{r}
+g1 <- ggplot(dated_community_data) + geom_bar(mapping = aes(x=grp, fill=member_casual)) +
+      scale_y_continuous(labels = unit_format(unit = "M", scale = 1e-6)) +
+      labs(title="Ride duration by member type", subtitle="Total count (2023)", x="") +
+      theme(axis.text.x = element_text(color="#993333", angle=45))
+
+g2 <- ggplot(dated_community_data, aes(x=grp, fill=member_casual)) +
+  geom_bar(position="fill") +
+  geom_text(
+    aes(label=signif(..count.. / tapply(..count.., ..x.., sum)[as.character(..x..)], digits=2)),
+    stat="count",
+    position=position_fill(vjust=0.5)) +
+  theme(axis.text.x = element_text(color="#993333", angle=45)) +
+  labs(title="Member type proportion by ride duration", subtitle="Total count (2023)", y="Proportion", x="")
+grid.arrange(g1, g2)
+```
+```{r}
+g1 <- ggplot(dated_community_data) + geom_bar(mapping = aes(x=start_hour, fill=member_casual)) +
+  scale_y_continuous(labels = unit_format(unit = "K", scale = 1e-3)) +
+  labs(title="Start hour count", subtitle="2023")
+g2 <- ggplot(dated_community_data, aes(x=start_hour, fill=member_casual)) +
+  geom_bar(position="fill") +
+  geom_text(
+    aes(label=signif(..count.. / tapply(..count.., ..x.., sum)[as.character(..x..)], digits=2)),
+    angle=90,
+    stat="count",
+    position=position_fill(vjust=0.5)) +
+  labs(title="Start hour by percentage of casual rides", subtitle="2023")
+grid.arrange(g1, g2)
+```
+
+```{r}
+g1 <- ggplot(dated_data) + geom_bar(mapping = aes(x=start_weekday, fill=member_casual)) +
+  scale_y_continuous(labels = unit_format(unit = "K", scale = 1e-3)) +
+  labs(title="Ride count by days of week")
+g2 <- ggplot(dated_data, aes(x=start_weekday, fill=member_casual)) +
+  geom_bar(position="fill") +
+  geom_text(
+    aes(label=signif(..count.. / tapply(..count.., ..x.., sum)[as.character(..x..)], digits=2)),
+    angle=90,
+    stat="count",
+    position=position_fill(vjust=0.5)) +
+  labs(title="Ride proportion for rider types by days of week")
+grid.arrange(g1, g2)
+```
+
+```{r}
+g1 <- ggplot(dated_data) + geom_bar(mapping = aes(x=start_month, fill=member_casual)) +
+  scale_y_continuous(labels = unit_format(unit = "K", scale = 1e-3)) +
+  labs(title="Ride count by month (2023)")
+g2 <- ggplot(dated_data, aes(x=start_monthx, fill=member_casual)) +
+  geom_bar(position="fill") +
+  geom_text(
+    aes(label=signif(..count.. / tapply(..count.., ..x.., sum)[as.character(..x..)], digits=2)),
+    angle=90,
+    stat="count",
+    position=position_fill(vjust=0.5)) +
+  labs(title="Ride proportion for rider types by month (2023)")
+grid.arrange(g1, g2)
+```
+
+I want to figure out the most popular starting and ending stations for casual for
+members, understanding which routes are more likely to be potential members
+(or not potential members will help us understand who we should be tageting)
+
+```{r}
+get_start_counts <- dated_community_data %>%
+  group_by(member_casual) %>%
+  count(start_station_id)
+
+get_end_counts <- dated_community_data %>%
+  group_by(member_casual) %>%
+  count(end_station_id)
+
+top_member_starts <- get_start_counts %>%
+  filter(member_casual=="member") %>%
+  arrange(desc(n)) %>%
+  head(30)
+
+top_casual_starts <- get_start_counts %>%
+  filter(member_casual=="casual") %>%
+  arrange(desc(n)) %>%
+  head(30)
+
+top_member_ends <- get_end_counts %>%
+  filter(member_casual=="member") %>%
+  arrange(desc(n)) %>%
+  head(30)
+
+top_casual_ends <- get_end_counts %>%
+  filter(member_casual=="casual") %>%
+  arrange(desc(n)) %>%
+  head(30)
+
+top_starts <- rbind(top_member_starts, top_casual_starts)
+
+top_ends <- rbind(top_member_ends, top_casual_ends)
+
+filtered_start_counts <- dated_community_data %>%
+  filter(
+    start_station_id %in% top_member_starts$start_station_id |
+    start_station_id %in% top_casual_starts$start_station_id
+  ) 
+
+filtered_end_counts <- dated_community_data %>%
+  filter(
+    end_station_id %in% top_member_ends$end_station_id |
+    end_station_id %in% top_casual_ends$end_station_id
+  )
+
+```
+
+```{r}
+ggplot(get_start_counts) + geom_col(mapping = aes(x=start_station_id, y=n, fill=member_casual))
+ggplot(filtered_start_counts) + geom_bar(mapping = aes(x=start_station_name, fill=member_casual)) +
+  theme(axis.text.x = element_text(color="#993333", angle=-90)) +
+  scale_y_continuous(labels = unit_format(unit = "K", scale = 1e-3))
+ggplot(filtered_start_counts, aes(x=start_station_name, fill=member_casual)) +
+  geom_bar(position="fill") +
+  geom_text(
+    aes(label=signif(..count.. / tapply(..count.., ..x.., sum)[as.character(..x..)], digits=2)),
+    stat="count",
+    angle=90,
+    position=position_fill(vjust=0.5)) +
+  labs(y="Proportion", angle=-90, x='') +
+  theme(axis.text.x = element_text(color="#993333", 
+                           angle=-90))
+
+```
+
+```{r}
+ggplot(get_end_counts) + geom_col(mapping = aes(x=end_station_id, y=n, fill=member_casual))
+ggplot(filtered_end_counts) + geom_bar(mapping = aes(x=end_station_name, fill=member_casual)) +
+  theme(axis.text.x = element_text(color="#993333", angle=-90)) +
+  scale_y_continuous(labels = unit_format(unit = "K", scale = 1e-3))
+ggplot(filtered_start_counts, aes(x=start_station_name, fill=member_casual)) +
+  geom_bar(position="fill") +
+  geom_text(
+    aes(label=signif(..count.. / tapply(..count.., ..x.., sum)[as.character(..x..)], digits=2)),
+    stat="count",
+    angle=90,
+    position=position_fill(vjust=0.5)) +
+  labs(y="Proportion", angle=-90) +
+  theme(axis.text.x = element_text(color="#993333", 
+                           angle=-90)) +
+  scale_y_continuous(labels = scales::percent) 
+
+```
+Next, I want to sort data based on proximity to landmarks, I am just going to
+compare lat/long b/c it will be much faster.
+
+
+This seems like a O(n^2) use case with nested forloops which is gonna be crazy slow...
+
+
+
+```{r}
+#calculate the std dev and average lat and lng for each station id
+avg_coord_start <- dated_community_data %>%
+  group_by(start_station_id) %>%
+  summarize(mean_lat=mean(start_lat), mean_lng=mean(start_lng))
+
+avg_coord_end <- dated_community_data %>%
+  group_by(end_station_id) %>%
+  summarize(mean_lat=mean(end_lat), mean_lng=mean(end_lng))
+```
+
+```{r}
+diff_m <- 2000
+matching_stations <- c()
+distance_m <- c()
+percent_casual <- c()
+for (i in 1:nrow(avg_coord_end)) {
+  lowest_distance <- diff_m + 1
+  for (j in 1:nrow(landmarks)) {
+    dist_in_m <- distm(
+      c(as.numeric(avg_coord_end[i, "mean_lng"]), as.numeric(avg_coord_end[i, "mean_lat"])),
+      c(landmarks[j, "longitude"], landmarks[j, "latitude"]),
+      fun = distGeo
+    )
+    if (dist_in_m < diff_m) {
+      if(dist_in_m < lowest_distance) {
+        if (lowest_distance != diff_m +1) {
+          distance_m <- append(head(distance_m, -1), dist_in_m)
+        } else {
+          end_id <- as.character(avg_coord_end[i, "end_station_id"])
+          num_casual <- (get_end_counts %>% filter(member_casual=="casual" & end_station_id==end_id))$n
+          num_member <- (get_end_counts %>% filter(member_casual=="member" & end_station_id==end_id))$n
+          per_cas <- num_casual/(num_casual + num_member)
+          matching_stations <- append(matching_stations, end_id)
+          if(identical(per_cas, numeric(0))) {
+            percent_casual <- append(percent_casual, 0) 
+          } else {
+            percent_casual <- append(percent_casual, per_cas)
+          }
+          distance_m <- append(distance_m, dist_in_m)
+        }
+        lowest_distance <- dist_in_m
+      }
+    }
+  }
+}
+df <- data.frame(
+  "end_station_id"=matching_stations,
+  "distance_from_landmark"=distance_m,
+  "percent_casual"=percent_casual
+)
+
+```
+
+```{r}
+ggplot(df) + geom_point(mapping=aes(x=distance_from_landmark, y=percent_casual)) +
+  labs(title="Percentage of casual rides for each station's distance to closest landmark", subtitle="") + 
+  scale_y_continuous(labels = scales::percent)
+```
+
+```{r}
+ggplot(data=tmp_chi_map) + geom_sf(aes(fill = percent_casual)) +
+geom_point(data=landmarks, mapping=aes(y=latitude, x=longitude, color='yellow')) +
+  lab(title="casual rider density per neighborhood with city landmarks")
+```
+ 
+# Cleanup
+
+```{r}
+rm(tmp_trip_data)
+rm(tmp_rides)
+rm()
+```
